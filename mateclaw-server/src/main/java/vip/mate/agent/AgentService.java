@@ -65,9 +65,26 @@ public class AgentService {
      * 按工作区列出 Agent
      */
     public List<AgentEntity> listAgentsByWorkspace(Long workspaceId) {
-        return agentMapper.selectList(new LambdaQueryWrapper<AgentEntity>()
-                .eq(AgentEntity::getWorkspaceId, workspaceId)
-                .orderByDesc(AgentEntity::getCreateTime));
+        return listAgentsByWorkspace(workspaceId, null);
+    }
+
+    /**
+     * 按工作区列出 Agent，可选过滤启用状态。
+     *
+     * @param enabled non-null restricts the result set to agents whose
+     *                {@code enabled} column matches the given value.
+     *                Pass {@code true} from chat selectors so disabled
+     *                agents disappear from the picker; the admin
+     *                management page passes {@code null} to keep
+     *                disabled rows visible for re-enabling.
+     */
+    public List<AgentEntity> listAgentsByWorkspace(Long workspaceId, Boolean enabled) {
+        LambdaQueryWrapper<AgentEntity> q = new LambdaQueryWrapper<AgentEntity>()
+                .eq(AgentEntity::getWorkspaceId, workspaceId);
+        if (enabled != null) {
+            q.eq(AgentEntity::getEnabled, enabled);
+        }
+        return agentMapper.selectList(q.orderByDesc(AgentEntity::getCreateTime));
     }
 
     public AgentEntity getAgent(Long id) {
@@ -467,24 +484,55 @@ public class AgentService {
 
     // ==================== StreamDelta ====================
 
-    public record StreamDelta(String content, String thinking, String eventType, Map<String, Object> eventData, boolean persistenceOnly) {
+    public record StreamDelta(String content, String thinking, String eventType, Map<String, Object> eventData,
+                              boolean persistenceOnly, boolean segmentOnly) {
 
         // 兼容构造器（广播+持久化）
         public StreamDelta(String content, String thinking) {
-            this(content, thinking, null, null, false);
+            this(content, thinking, null, null, false, false);
+        }
+
+        // 显式 5-参构造器：保留旧调用点对 (content, thinking, eventType, eventData, persistenceOnly) 的兼容
+        public StreamDelta(String content, String thinking, String eventType,
+                           Map<String, Object> eventData, boolean persistenceOnly) {
+            this(content, thinking, eventType, eventData, persistenceOnly, false);
         }
 
         /** 仅用于持久化，不再广播（内容已由 NodeStreamingChatHelper 实时广播过） */
         public static StreamDelta persistOnly(String content, String thinking) {
-            return new StreamDelta(content, thinking, null, null, true);
+            return new StreamDelta(content, thinking, null, null, true, false);
+        }
+
+        /**
+         * Per-iteration narrative routing for ReasoningNode / SummarizingNode output.
+         *
+         * <p>The accumulator should:
+         * <ul>
+         *   <li>append the text to the in-flight {@code segments} entry so the UI's
+         *       segmented view still renders the intermediate "I'll look it up…"
+         *       narration between tool cards;</li>
+         *   <li>NOT broadcast — already broadcast live by NodeStreamingChatHelper;</li>
+         *   <li>NOT append to the top-level {@code content} StringBuilder, which is
+         *       what gets persisted as {@code mate_message.content}. That field
+         *       should hold the final-answer span only — otherwise multiple
+         *       iterations stack into "我来…让我…然后…" walls that next-turn replay
+         *       sees as unanswered chain-of-thought (issue #120 narration leg).</li>
+         * </ul>
+         *
+         * <p>Implies {@code persistenceOnly} (no broadcast) at the accumulator
+         * layer, but is a stricter promise: <em>nothing</em> reaches the top-level
+         * persisted content field via this flavor.
+         */
+        public static StreamDelta segmentOnly(String content, String thinking) {
+            return new StreamDelta(content, thinking, null, null, true, true);
         }
 
         public static StreamDelta empty() {
-            return new StreamDelta(null, null, null, null, false);
+            return new StreamDelta(null, null, null, null, false, false);
         }
 
         public static StreamDelta event(String type, Map<String, Object> data) {
-            return new StreamDelta(null, null, type, data, false);
+            return new StreamDelta(null, null, type, data, false, false);
         }
 
         public boolean isEvent() {

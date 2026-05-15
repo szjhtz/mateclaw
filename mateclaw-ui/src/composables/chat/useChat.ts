@@ -17,6 +17,45 @@ import type { Message, MessageContentPart, MessageSegment, StreamPhase, Heartbea
 import { classifyBackendError, type ChatErrorInfo } from '@/types/chatError'
 import { http } from '@/api'
 
+/**
+ * Snapshot of a {@code compact_status} SSE event. Mirrors the payload built
+ * by ConversationWindowManager.broadcastCompactStatus so the UI can render a
+ * progress chip without each consumer reverse-engineering field names.
+ */
+export interface CompactStatusEvent {
+  /** start | pair_safe | summarize | done | skipped | failed */
+  status: 'start' | 'pair_safe' | 'summarize' | 'done' | 'skipped' | 'failed'
+  /** Server clock when the event fired. */
+  timestamp?: number
+  /** Total prompt tokens before compaction began (start / done payloads). */
+  preTokens?: number
+  /** Total prompt tokens after the boundary lands (done payload). */
+  postTokens?: number
+  /** Messages in scope at start. */
+  messagesIn?: number
+  /** Messages folded into the structured summary (done payload). */
+  messagesSummarized?: number
+  /** Recent messages preserved verbatim (done payload). */
+  tailKept?: number
+  /** Tool-result bodies spilled to disk this turn (done payload). */
+  toolResultsSpilled?: number
+  /** Whether the first-user anchor was injected (done payload). */
+  anchored?: boolean
+  /** Why compaction was skipped or failed: insufficient_messages, pair_boundary_collapsed, summary_generation_failed, ... */
+  reason?: string
+  /** Pair-safety boundary moved from / to indices (pair_safe payload). */
+  movedFrom?: number
+  movedTo?: number
+  /** Summary budget the LLM was asked to fit into (summarize payload). */
+  summaryBudget?: number
+  /** Trigger label baked in by the backend (start / done — currently token_threshold). */
+  trigger?: string
+  /** Tail kept fallback when summary generation failed. */
+  fallbackKept?: number
+  /** True when the boundary was served from the in-memory summary cache. */
+  fromCache?: boolean
+}
+
 export interface UseChatOptions {
   /** Base API URL */
   baseUrl: string
@@ -62,6 +101,13 @@ export interface UseChatReturn {
   queueSize: import('vue').ComputedRef<number>
   /** Latest heartbeat data */
   heartbeat: import('vue').Ref<HeartbeatData | null>
+  /**
+   * Latest compact_status SSE event for the active turn. Drives the in-prompt
+   * compaction chip / boundary marker so the user can see "preparing context"
+   * pauses (start → pair_safe → summarize → done/skipped/failed). Cleared back
+   * to {@code null} when a turn finishes, so the chip auto-hides.
+   */
+  compactStatus: import('vue').Ref<CompactStatusEvent | null>
   /**
    * Fine-grained pre-token lifecycle stage. Drives the loading bar copy in the
    * window between "send pressed" and "first delta arrived". `null` once a
@@ -127,6 +173,14 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   let stopFallbackTimer: ReturnType<typeof setTimeout> | null = null
   const streamPhase = ref<StreamPhase>('idle')
   const phaseInfo = ref<PhaseEventData | null>(null)
+  /**
+   * Latest compact_status event for the current turn. Reset to null on
+   * stream end and on every conversation switch so the chip auto-hides.
+   * "done" events are kept on screen for a short interval by the consumer
+   * (see StreamLoadingBar / CompactStatusBadge) rather than being cleared
+   * immediately, so the user gets a chance to see the result.
+   */
+  const compactStatus = ref<CompactStatusEvent | null>(null)
 
   /** All segments of the current assistant message (for segmented display) */
   const currentSegments = ref<MessageSegment[]>([])
@@ -493,6 +547,56 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         if (data.assistantMessageId) {
           msg.id = data.assistantMessageId
         }
+        // Merge server-authoritative segment annotations (carries fields the
+        // live SSE path can't compute, like the 'superseded' marker the
+        // backend's SegmentSupersedeDetector writes onto pre-tool model
+        // claims that the actual tool result replaced). The local segments
+        // keep their content / status; the server segments only contribute
+        // their annotation fields.
+        //
+        // Matching: client and server use DIFFERENT id schemes (client uses
+        // timestamp-based ids like `seg-1778744207326-0`; server uses
+        // `co-0 / to-1 / th-2` from its accumulator). They DO produce
+        // segments in the same temporal order from the same event stream,
+        // so we pair by (type, intra-type index): the N-th content/tool/
+        // thinking segment locally aligns with the N-th of the same type
+        // on the server. Extra local-only segments (rare streaming
+        // artifacts that the server pruned) end up unmatched and pass
+        // through untouched — no risk of mislabelling.
+        if (Array.isArray(data.segments) && data.segments.length > 0) {
+          const metadata = parseMetadata((msg as any).metadata)
+          const localSegs = (metadata?.segments as any[]) || []
+          if (localSegs.length > 0) {
+            const serverByTypeIndex = new Map<string, any>()
+            const serverTypeCount = new Map<string, number>()
+            for (const s of data.segments as any[]) {
+              if (!s || typeof s !== 'object' || typeof s.type !== 'string') continue
+              const idx = serverTypeCount.get(s.type) || 0
+              serverByTypeIndex.set(`${s.type}#${idx}`, s)
+              serverTypeCount.set(s.type, idx + 1)
+            }
+            if (serverByTypeIndex.size > 0) {
+              const localTypeCount = new Map<string, number>()
+              const merged = localSegs.map((local: any) => {
+                if (!local || typeof local.type !== 'string') return local
+                const idx = localTypeCount.get(local.type) || 0
+                localTypeCount.set(local.type, idx + 1)
+                const remote = serverByTypeIndex.get(`${local.type}#${idx}`)
+                if (!remote) return local
+                const next = { ...local }
+                if (remote.superseded !== undefined) next.superseded = remote.superseded
+                if (remote.supersededBySegmentId !== undefined) {
+                  next.supersededBySegmentId = remote.supersededBySegmentId
+                }
+                if (remote.supersededReason !== undefined) {
+                  next.supersededReason = remote.supersededReason
+                }
+                return next
+              })
+              ;(msg as any).metadata = { ...(metadata || {}), segments: merged }
+            }
+          }
+        }
         messages.value[msgIndex] = { ...msg }
       }
       currentAssistantId.value = null
@@ -502,6 +606,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       : data.status === 'stopped' ? 'stopped' : 'completed'
     if (data.status !== 'awaiting_approval') {
       phaseInfo.value = null
+      compactStatus.value = null
       lifecycleStage.value = null
       expirePendingApprovals(data.status === 'stopped' ? 'stopped' : 'completed')
     }
@@ -584,6 +689,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     error.value = new Error(errorMessage)
     streamPhase.value = 'idle'
     phaseInfo.value = null
+    compactStatus.value = null
     lifecycleStage.value = null
     // Clear queue on error to avoid stale state
     messageQueue.clear()
@@ -754,6 +860,15 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         },
       },
     } as any)
+  })
+
+  // Context-compaction progress. Fires before the LLM call when the window
+  // manager has to evict old turns to fit budget. The chip uses this to show
+  // the user that an unexpected pause is the planner thinking about
+  // context, not a network stall.
+  stream.on('compact_status', (data) => {
+    if (isStaleEvent(data)) return
+    compactStatus.value = { ...data } as CompactStatusEvent
   })
 
   stream.on('phase', (data) => {
@@ -1645,6 +1760,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     // Mark as stopped immediately so the UI gives instant feedback
     streamPhase.value = 'stopped'
     phaseInfo.value = null
+    compactStatus.value = null
 
     // Install fallback timer before any await so it is not missed by a concurrent resetForNewConversation
     if (stopFallbackTimer) clearTimeout(stopFallbackTimer)
@@ -1792,6 +1908,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     segIdCounter.value = 0
     streamPhase.value = 'idle'
     phaseInfo.value = null
+    compactStatus.value = null
     lifecycleStage.value = null
     error.value = null
     messageQueue.clear()
@@ -1811,6 +1928,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     hasQueued: messageQueue.hasQueued,
     queueSize: messageQueue.queueSize,
     heartbeat,
+    compactStatus,
     lifecycleStage,
     sendMessage,
     stopGeneration,
